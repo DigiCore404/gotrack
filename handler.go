@@ -312,6 +312,21 @@ if prev != nil {
     }
 }
 
+// Fallback: if prev is nil (e.g., just restarted after a stop), use snatch.lastaction
+if seedtimeDelta == 0 && seeder && prev == nil {
+    if lastAct, ok := db.GetSnatchLastAction(p.UserID, ts.ID); ok && !lastAct.IsZero() {
+        if dt := time.Now().Sub(lastAct); dt > 0 {
+            // clamp absurd gaps (e.g., if client was offline for days)
+            // adjust or remove the clamp to your taste
+            if dt > 24*time.Hour {
+                dt = 24 * time.Hour
+            }
+            seedtimeDelta = int64(dt.Seconds())
+        }
+    }
+}
+
+
 	// On "completed" bump torrents + finishedat
 	if timesCompleted == 1 {
 		_ = db.OnCompleted(torrentID, p.UserID)

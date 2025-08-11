@@ -25,6 +25,19 @@ func (mysqlDebugLogger) Print(v ...interface{}) {
     }
 }
 
+func (d *DB) GetSnatchLastAction(userID, torrentID int) (time.Time, bool) {
+    var t time.Time
+    err := d.db.QueryRow(
+        `SELECT lastaction FROM snatch WHERE userid=? AND torrentid=? LIMIT 1`,
+        userID, torrentID,
+    ).Scan(&t)
+    if err != nil {
+        return time.Time{}, false
+    }
+    return t, true
+}
+
+
 /* ===== FREELEECH WINDOW (settings) ===== */
 
 // LoadFreeleechWindow returns (open?, open_time, close_time, hasWindow?, error)
