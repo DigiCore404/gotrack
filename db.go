@@ -6,12 +6,23 @@ import (
 	"fmt"
 	"log"
 	"time"
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 type DB struct {
 	db       *sql.DB
 	readOnly bool
+}
+
+
+
+// Only prints MySQL driver logs when config.DebugAnnounce is true
+type mysqlDebugLogger struct{}
+
+func (mysqlDebugLogger) Print(v ...interface{}) {
+    if config != nil && config.DebugAnnounce {
+        log.Print(v...) // driver already prefixes with [mysql]
+    }
 }
 
 /* ===== FREELEECH WINDOW (settings) ===== */
@@ -50,8 +61,13 @@ func (d *DB) LoadFreeleechWindow() (bool, time.Time, time.Time, bool, error) {
 /* ===== INIT / POOL ===== */
 
 func InitDB(cfg DBConfig) (*DB, error) {
+
+       // Enable conditional driver logging
+       mysql.SetLogger(mysqlDebugLogger{})
+
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4,utf8",
 		cfg.User, cfg.Pass, cfg.Host, cfg.Port, cfg.Name)
+
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err

@@ -58,7 +58,7 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if config.LogVerbose || config.DebugAnnounce {
+	if config.DebugAnnounce {
 		log.Printf("[ANNOUNCE DEBUG] ip=%s passkey=%s rawQS=%q",
 			getRealIP(r), passkey, r.URL.RawQuery)
 	}
