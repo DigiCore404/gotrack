@@ -2,7 +2,5 @@
 
 ## Quick start
 1) Edit `config.yaml` with your DB credentials.
-2) Create tables:
-   ```sql
-   -- in your MariaDB
-   SOURCE schema.sql;
+2) go build .
+3) ./gotrack
