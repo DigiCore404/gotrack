@@ -1,0 +1,66 @@
+listen_addr: ":8098"
+
+db:
+  host: "127.0.0.1"
+  port: 3310
+  user: ""
+  pass: ""
+  name: ""
+
+peer_flush_interval: 0           # set >0 to enable periodic writes (disabled in safe_mode)
+peer_ttl_seconds: 3600           # remove peers inactive for this many seconds
+peer_purge_interval_sec: 300     # how often to run peer janitor
+purge_db_on_expire: true         # also delete expired peers from DB
+
+user_cache_ttl: 120
+safe_mode: false                 # true = read-only, never writes peers to DB
+log_verbose: true
+
+ip_whitelist: []                 # optional allow-list
+ip_banlist: []                   # optional deny-list
+
+user_agent_ban:                  # substring matches
+  - "Transmission 2.9"
+  - "BadClient"
+  - "btpd" 
+  - "LimeWire"
+  - "BitComet"
+  - "BTuga" 
+  - "ktorrent" 
+  - "Mozilla"
+  - "Shareaza" 
+  - "BitLord" 
+  - "BitTorrent/3.4.2" 
+  - "Java" 
+  - "Azureus"
+  - "uTorrent/343"
+  - "uTorrent/345" 
+  - "uTorrent/3100"
+  - "uTorrent/354" 
+  - "uTorrent/353"
+  - "uTorrent/349" 
+  - "uTorrent/355"
+  - "uTorrentMac/1630"
+  - "uTorrent/3130" 
+  - "uTorrent/351" 
+  - "uTorrent/330B"
+  - "uTorrent/3220"
+  - "uTorrent/3000"
+
+admin_api_key: "change-this-key"   # required for /stats
+
+gzip: true
+allow_old_protocols: false
+allow_global_scrape: false
+default_give_peers: 50
+max_give_peers: 150
+announce_interval_min: 1800
+announce_interval_max: 2400
+rate_limitation: true
+rate_limitation_warn_up: 150
+rate_limitation_err_up: 10000
+register_stats: true
+upload_multiplier: 1
+download_multiplier: 1
+force_fl_new_archive: true  
+debug_announce: true
