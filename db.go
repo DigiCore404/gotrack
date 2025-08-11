@@ -135,14 +135,26 @@ func (d *DB) GetUserByPasskey(passkey string) (*User, error) {
 }
 
 type UserExtra struct {
-	Class      int
-	LeechBonus int
+	Class          int
+	LeechBonus     int
+	MbitUpp        int
+	MbitNer        int
+	LeechStartUnix int64
 }
 
 func (d *DB) GetUserExtra(userID int) (UserExtra, error) {
 	var out UserExtra
-	row := d.db.QueryRow(`SELECT class, leechbonus FROM users WHERE id = ?`, userID)
-	err := row.Scan(&out.Class, &out.LeechBonus)
+	row := d.db.QueryRow(`
+		SELECT class,
+		       leechbonus,
+		       CAST(mbitupp AS SIGNED),
+		       CAST(mbitner  AS SIGNED),
+		       UNIX_TIMESTAMP(leechstart)
+		  FROM users
+		 WHERE id = ?`,
+		userID,
+	)
+	err := row.Scan(&out.Class, &out.LeechBonus, &out.MbitUpp, &out.MbitNer, &out.LeechStartUnix)
 	return out, err
 }
 
@@ -256,6 +268,29 @@ func (d *DB) LoadTorrentStats() (map[[20]byte]TorrentStat, error) {
 	return out, nil
 }
 
+type torrentMeta struct {
+	ID      int
+	Frl     bool
+	Section string
+	Size    uint64
+	Added   time.Time
+}
+
+func (d *DB) getTorrentMetaByHash(ihHex string) (torrentMeta, error) {
+	var m torrentMeta
+	var frl int
+	err := d.db.QueryRow(`
+		SELECT id, frileech, section, size, added
+		  FROM torrents
+		 WHERE info_hash = ?
+		 LIMIT 1`, ihHex).
+		Scan(&m.ID, &frl, &m.Section, &m.Size, &m.Added)
+	m.Frl = frl == 1
+	return m, err
+}
+
+
+
 /* ===== IP bans / settings ===== */
 
 func (d *DB) LoadIPBans() ([]string, error) {
@@ -288,6 +323,79 @@ func (d *DB) LoadSitewideFreeleech() (bool, error) {
 }
 
 /* ===== WRITE PATHS ===== */
+
+func (d *DB) UpsertSnatch(
+	userID, torrentID int,
+	ip string, port int, agent string,
+	connectable bool,
+	timesStarted, timesCompleted, timesUpdated, timesStopped int,
+	addUp, addDown uint64,
+	seedtimeDelta int64,
+) error {
+	if d.readOnly {
+		return nil
+	}
+
+	connInt := 0
+	if connectable {
+		connInt = 1
+	}
+
+	// 1) Try UPDATE first (incremental, like your PHP)
+	res, err := d.db.Exec(`
+		UPDATE snatch
+		   SET timesStarted   = timesStarted   + ?,
+		       timesCompleted = timesCompleted + ?,
+		       timesUpdated   = timesUpdated   + ?,
+		       timesStopped   = timesStopped   + ?,
+		       lastaction     = NOW(),
+		       uploaded       = uploaded + ?,
+		       downloaded     = downloaded + ?,
+		       seedtime       = seedtime + ?,
+		       connectable    = ?
+		 WHERE userid    = ?
+		   AND torrentid = ?
+	`,
+		timesStarted, timesCompleted, timesUpdated, timesStopped,
+		addUp, addDown, seedtimeDelta, connInt,
+		userID, torrentID,
+	)
+	if err != nil {
+		return err
+	}
+	aff, _ := res.RowsAffected()
+	if aff > 0 {
+		return nil
+	}
+
+	// 2) No row -> INSERT
+	_, err = d.db.Exec(`
+		INSERT INTO snatch (
+			userid, torrentid, ip, port, agent, connectable,
+			klar, lastaction,
+			timesStarted, timesCompleted, timesUpdated,
+			uploaded, downloaded, seedtime, seeding, hnr, prehnr, immune
+		) VALUES (
+			?, ?, ?, ?, ?, ?,
+			NOW(), NOW(),
+			?, ?, ?,
+			?, ?, ?, 'no', 'no', 'no', 'no'
+		)
+	`,
+		userID, torrentID, ip, port, agent, connInt,
+		timesStarted, timesCompleted, timesUpdated,
+		addUp, addDown, max64(seedtimeDelta, 0),
+	)
+	return err
+}
+
+func max64(a, b int64) int64 {
+	if a > b { return a }
+	return b
+}
+
+
+
 
 func (d *DB) UpsertPeer(p *Peer, userID int, agent string, toGo uint64, seeder bool, connectable bool, frileech bool) error {
 	if d.readOnly {
@@ -344,10 +452,34 @@ VALUES
    0, 0, ?, 0, 0, 0,
    ?, 0, ?, ?)
 ON DUPLICATE KEY UPDATE
+  -- keep started as the first-seen time; don't touch it here
   uploaded      = VALUES(uploaded),
   downloaded    = VALUES(downloaded),
   to_go         = VALUES(to_go),
   seeder        = VALUES(seeder),
+
+  -- compute Mbps from offsets and time between announces, then advance offsets
+  mbitupp       = CASE
+                    WHEN TIMESTAMPDIFF(SECOND, last_action, VALUES(last_action)) > 0
+                    THEN GREATEST(
+                           0,
+                           ((VALUES(uploaded)   - uploadoffset)   * 8)
+                           / TIMESTAMPDIFF(SECOND, last_action, VALUES(last_action))
+                         )
+                    ELSE mbitupp
+                  END,
+  mbitner       = CASE
+                    WHEN TIMESTAMPDIFF(SECOND, last_action, VALUES(last_action)) > 0
+                    THEN GREATEST(
+                           0,
+                           ((VALUES(downloaded) - downloadoffset) * 8)
+                           / TIMESTAMPDIFF(SECOND, last_action, VALUES(last_action))
+                         )
+                    ELSE mbitner
+                  END,
+  uploadoffset   = VALUES(uploaded),
+  downloadoffset = VALUES(downloaded),
+
   last_action   = VALUES(last_action),
   connectable   = VALUES(connectable),
   userid        = VALUES(userid),
@@ -355,6 +487,7 @@ ON DUPLICATE KEY UPDATE
   frileech      = VALUES(frileech),
   section       = VALUES(section),
   torrentsize   = VALUES(torrentsize)
+
 `
 	_, err := d.db.Exec(q,
 		// INSERT

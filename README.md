@@ -4,5 +4,3 @@
 1) Edit `config.yaml` with your DB credentials.
 2) go build .
 3) ./go-tracker
-
-
