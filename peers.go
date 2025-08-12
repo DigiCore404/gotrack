@@ -34,6 +34,18 @@ func NewPeerStore() *PeerStore {
 	return &PeerStore{peers: make(map[[20]byte]map[[20]byte]*Peer)}
 }
 
+
+func (ps *PeerStore) SetConnectable(t [20]byte, id [20]byte, ok bool) {
+    ps.mu.Lock()
+    defer ps.mu.Unlock()
+    if m := ps.peers[t]; m != nil {
+        if p := m[id]; p != nil {
+            p.Connectable = ok
+        }
+    }
+}
+
+
 func (ps *PeerStore) Get(torrent [20]byte, peerID [20]byte) *Peer {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()

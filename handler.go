@@ -15,171 +15,213 @@ import (
 var announceCount uint64
 
 func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&announceCount, 1)
+	atomic.AddUint64(&announceCount, 1)
 
-        // Do NOT reject "old protocol" flags (Deluge may send no_peer_id=1)
-        if IsUserAgentBanned(r.UserAgent()) {
-                BencodeError(w, "Banned client")
-                return
-        }
-        ip := getRealIP(r)
-        if !ipRules.IsAllowed(ip) {
-                BencodeError(w, "Banned IP")
-                return
-        }
+	// Do NOT reject "old protocol" flags (Deluge may send no_peer_id=1)
+	if IsUserAgentBanned(r.UserAgent()) {
+		BencodeError(w, "Banned client")
+		return
+	}
+	ip := getRealIP(r)
+	if !ipRules.IsAllowed(ip) {
+		BencodeError(w, "Banned IP")
+		return
+	}
 
-        passkey := r.URL.Query().Get("passkey")
-        if len(passkey) != 32 {
-                BencodeError(w, "Invalid passkey")
-                return
-        }
-        user, ok := userCache.GetOrFetch(passkey)
-        if !ok {
-                BencodeError(w, "Unknown passkey")
-                return
-        }
-        if !user.Enabled {
-                BencodeError(w, "Account disabled")
-                return
-        }
-        if user.DownloadBan {
-                BencodeError(w, "Download banned")
-                return
-        }
+	passkey := r.URL.Query().Get("passkey")
+	if len(passkey) != 32 {
+		BencodeError(w, "Invalid passkey")
+		return
+	}
+	user, ok := userCache.GetOrFetch(passkey)
+	if !ok {
+		BencodeError(w, "Unknown passkey")
+		return
+	}
+	if !user.Enabled {
+		BencodeError(w, "Account disabled")
+		return
+	}
+	if user.DownloadBan {
+		BencodeError(w, "Download banned")
+		return
+	}
 
-        inf, ok := parse20(r.URL.Query().Get("info_hash"))
-        if !ok {
-                BencodeError(w, "Invalid info hash")
-                return
-        }
-        pid, ok := parse20(r.URL.Query().Get("peer_id"))
-        if !ok {
-                BencodeError(w, "Invalid peer id")
-                return
-        }
+	inf, ok := parseInfoHashLoose(r)
+	if !ok {
+		BencodeError(w, "Invalid info hash")
+		return
+	}
 
-        if config.DebugAnnounce {
-                log.Printf("[ANNOUNCE DEBUG] ip=%s passkey=%s rawQS=%q",
-                        getRealIP(r), passkey, r.URL.RawQuery)
-        }
+	pid, ok := parse20(r.URL.Query().Get("peer_id"))
+	if !ok {
+		BencodeError(w, "Invalid peer id")
+		return
+	}
 
-        port, _ := atoiSafe(r.URL.Query().Get("port"))
-        if port < 1 || port > 65535 {
-                BencodeError(w, "Invalid port")
-                return
-        }
-        uploaded := u64Safe(r.URL.Query().Get("uploaded"))
-        downloaded := u64Safe(r.URL.Query().Get("downloaded"))
-        left := u64Safe(r.URL.Query().Get("left"))
-        event := r.URL.Query().Get("event")
-        numwant := clampNumwant(r.URL.Query().Get("numwant"))
+	if config.DebugAnnounce {
+		log.Printf("[ANNOUNCE DEBUG] ip=%s passkey=%s rawQS=%q",
+			getRealIP(r), passkey, r.URL.RawQuery)
+	}
 
-        seeder := left == 0
+	port, _ := atoiSafe(r.URL.Query().Get("port"))
+	if port < 1 || port > 65535 {
+		BencodeError(w, "Invalid port")
+		return
+	}
+	uploaded := u64Safe(r.URL.Query().Get("uploaded"))
+	downloaded := u64Safe(r.URL.Query().Get("downloaded"))
+	left := u64Safe(r.URL.Query().Get("left"))
+	event := r.URL.Query().Get("event")
+	numwant := clampNumwant(r.URL.Query().Get("numwant"))
 
-        var tHash, pID [20]byte
-        copy(tHash[:], inf)
-        copy(pID[:], pid)
+	seeder := left == 0
 
-        // capture previous snapshot BEFORE we mutate the store
-        prev := peerStore.Get(tHash, pID)
+	var tHash, pID [20]byte
+	copy(tHash[:], inf)
+	copy(pID[:], pid)
 
-        peer := &Peer{
-                Torrent:    tHash,
-                UserID:     user.ID,
-                PeerID:     pID,
-                IP:         ip,
-                Port:       port,
-                Uploaded:   uploaded,
-                Downloaded: downloaded,
-                Seeder:     seeder,
-                LastAction: nowUnix(),
-        }
+	// capture previous snapshot BEFORE we mutate the store
+	prev := peerStore.Get(tHash, pID)
 
-        // In-memory index
-        if event == "stopped" {
-                peerStore.Remove(tHash, pID)
-        } else {
-                peer.Frileech = flManager.IsFreeleech(tHash)
-                peerStore.AddOrUpdate(peer)
-                EnqueueProbe(peer) // async connectable probe
-        }
+	peer := &Peer{
+		Torrent:    tHash,
+		UserID:     user.ID,
+		PeerID:     pID,
+		IP:         ip,
+		Port:       port,
+		Uploaded:   uploaded,
+		Downloaded: downloaded,
+		Seeder:     seeder,
+		LastAction: nowUnix(),
+	}
+	// preserve last known connectable status
+	if prev != nil {
+		peer.Connectable = prev.Connectable
+	}
 
-        // Response peers (compact)
-        plist := peerStore.SelectPeers(tHash, numwant, seeder)
-        var compact []byte
-        for _, p := range plist {
-                if b := CompactPeer(p); b != nil {
-                        compact = append(compact, b...)
-                }
-        }
+	// In-memory index
+	if event == "stopped" {
+		peerStore.Remove(tHash, pID)
+	} else {
+		peer.Frileech = flManager.IsFreeleech(tHash)
+		peerStore.AddOrUpdate(peer)
+	}
 
-        interval := rand.Intn(config.AnnounceIntervalMax-config.AnnounceIntervalMin+1) + config.AnnounceIntervalMin
+	// Response peers (compact)
+	plist := peerStore.SelectPeers(tHash, numwant, seeder)
+	var compact []byte
+	for _, p := range plist {
+		if b := CompactPeer(p); b != nil {
+			compact = append(compact, b...)
+		}
+	}
 
-if !config.SafeMode && config.RegisterStats {
-    applyStats(r, peer, uploaded, downloaded, seeder, ip, port, r.UserAgent(), event, prev)
+	interval := rand.Intn(config.AnnounceIntervalMax-config.AnnounceIntervalMin+1) + config.AnnounceIntervalMin
+
+	// Stats + snatch updates
+	if !config.SafeMode && config.RegisterStats {
+		applyStats(r, peer, uploaded, downloaded, seeder, ip, port, r.UserAgent(), event, prev)
+	}
+
+	// DB peer write
+	if !config.SafeMode {
+		if event == "stopped" {
+			if err := db.DeletePeer(peer); err != nil {
+				log.Printf("[DB] DeletePeer error: %v", err)
+			}
+			// RECOUNT (exact counts from peers → torrents)
+			ihHex := hex.EncodeToString(tHash[:])
+			_ = db.RecountTorrentCountsByHash(ihHex)
+		} else {
+			// UpsertPeer(peer, userID, agent, toGo, seeder, connectable, frileech)
+			if err := db.UpsertPeer(
+				peer,
+				user.ID,
+				r.UserAgent(),
+				left,
+				seeder,
+				peer.Connectable, // current flag; prober may update later
+				peer.Frileech,    // from flManager
+			); err != nil {
+				log.Printf("[DB] UpsertPeer failed: %v", err)
+			} else {
+				// RECOUNT (exact counts from peers → torrents)
+				ihHex := hex.EncodeToString(tHash[:])
+				_ = db.RecountTorrentCountsByHash(ihHex)
+			}
+		}
+	}
+
+	// enqueue the probe *after* the peer row exists
+	if event != "stopped" {
+		EnqueueProbe(peer) // async connectable probe
+	}
+
+	// --- Uploader first announce handling (ensure snatch + mark finished now) ---
+	if !config.SafeMode && prev == nil && seeder {
+		tid := 0
+		if ts, ok := torrentStats.Get(tHash); ok && ts.ID > 0 {
+			tid = ts.ID
+		}
+		if tid == 0 {
+			if meta, err := db.getTorrentMetaByHash(hashHex(tHash)); err == nil && meta.ID > 0 {
+				tid = meta.ID
+			}
+		}
+		if tid > 0 {
+			_ = db.UpsertSnatch(
+				user.ID, tid,
+				ip, port, r.UserAgent(),
+				peer.Connectable,
+				1, 1, 0, 0,
+				0, 0,
+				true,
+			)
+			_, _ = db.db.Exec(`UPDATE snatch SET finishedat = NOW() WHERE userid = ? AND torrentid = ?`, user.ID, tid)
+		}
+	}
+
+	// Counts for clients (seeders/leechers/completed)
+	s, l := peerStore.CountsFor(tHash)
+	if s == 0 && l == 0 {
+		if ts, ok := torrentStats.Get(tHash); ok {
+			s, l = ts.Seeders, ts.Leechers
+		}
+	}
+	comp := 0
+	if ts, ok := torrentStats.Get(tHash); ok {
+		comp = ts.Completed
+	}
+
+	var seedDelta int64
+	if prev != nil && seeder {
+		d := nowUnix() - prev.LastAction
+		if d > 0 {
+			seedDelta = d
+		}
+	}
+
+	if config.LogVerbose || config.DebugAnnounce {
+		mode := "normal"
+		if flManager.Sitewide() {
+			mode = "SITEWIDE-FL"
+		} else if peer.Frileech {
+			mode = "FL"
+		}
+		log.Printf("[ANNOUNCE] ip=%s uid=%d event=%q seed=%t ih=%s want=%d peers=%d mode=%s complete=%d incomplete=%d downloaded=%d seedtime+=%ds",
+			ip, user.ID, event, seeder, hashHex(tHash), numwant, len(plist), mode, s, l, comp, seedDelta)
+	}
+
+	// Send bencoded response
+	WriteBencode(w, map[string]any{
+		"interval":   interval,
+		"peers":      compact,
+		"complete":   s,
+		"incomplete": l,
+		"downloaded": comp,
+	})
 }
-
-        if !config.SafeMode {
-                if event == "stopped" {
-                        if err := db.DeletePeer(peer); err != nil {
-                                log.Printf("[DB] DeletePeer error: %v", err)
-                        }
-                } else {
-                        // UpsertPeer(peer, userID, agent, toGo, seeder, connectable, frileech)
-                        if err := db.UpsertPeer(
-                                peer,
-                                user.ID,
-                                r.UserAgent(),
-                                left,
-                                seeder,
-                                peer.Connectable, // current flag; prober may update later
-                                peer.Frileech,    // from flManager
-                        ); err != nil {
-                                log.Printf("[DB] UpsertPeer failed: %v", err)
-                        }
-                }
-        }
-
-        // Counts for clients (seeders/leechers/completed)
-        s, l := peerStore.CountsFor(tHash)
-        if s == 0 && l == 0 {
-                if ts, ok := torrentStats.Get(tHash); ok {
-                        s, l = ts.Seeders, ts.Leechers
-                }
-        }
-        comp := 0
-        if ts, ok := torrentStats.Get(tHash); ok {
-                comp = ts.Completed
-        }
-
-        var seedDelta int64
-        if prev != nil && seeder {
-                d := nowUnix() - prev.LastAction
-                if d > 0 { seedDelta = d }
-        }
-
-        if config.LogVerbose || config.DebugAnnounce {
-                mode := "normal"
-                if flManager.Sitewide() {
-                        mode = "SITEWIDE-FL"
-                } else if peer.Frileech {
-                        mode = "FL"
-                }
-                log.Printf("[ANNOUNCE] ip=%s uid=%d event=%q seed=%t ih=%s want=%d peers=%d mode=%s complete=%d incomplete=%d downloaded=%d seedtime+=%ds",
-                        ip, user.ID, event, seeder, hashHex(tHash), numwant, len(plist), mode, s, l, comp, seedDelta)
-        }
-
-        // Send bencoded response
-        WriteBencode(w, map[string]any{
-                "interval":   interval,
-                "peers":      compact,
-                "complete":   s,    // seeders
-                "incomplete": l,    // leechers
-                "downloaded": comp, // completed
-        })
-}
-
-
 
 func applyStats(
 	r *http.Request,
@@ -190,21 +232,36 @@ func applyStats(
 	port int,
 	agent string,
 	event string,
-	prev *Peer, // use snapshot captured BEFORE store mutation
+	prev *Peer, // snapshot captured BEFORE store mutation
 ) {
+	// 1) Load torrent meta, with DB fallback if cache miss (PHP parity)
 	ts, _ := torrentStats.Get(p.Torrent)
+	if ts.ID == 0 {
+		if meta, err := db.getTorrentMetaByHash(hex.EncodeToString(p.Torrent[:])); err == nil && meta.ID > 0 {
+			ts.ID = meta.ID
+			ts.Section = meta.Section
+			ts.Frileech = meta.Frl
+			ts.Added = meta.Added
+		}
+	}
+	if ts.ID == 0 {
+		// Still no ID? Nothing to update.
+		return
+	}
+
+	// 2) User extras
 	extra, err := db.GetUserExtra(p.UserID)
 	if err != nil {
 		return
 	}
 
-	// --- Rate-limit check (warn/error like PHP) ---
+	// 3) Optional rate-limit logging (same as before)
 	skipStats := false
 	if config.RateLimitation && prev != nil && prev.LastAction > 0 {
 		dt := float64(nowUnix() - prev.LastAction)
 		if dt > 0 {
 			upDelta := float64(uploaded - prev.Uploaded) / (1024 * 1024) // MB
-			upRate := upDelta / dt                                       // MB/s
+			upRate := upDelta / dt                                        // MB/s
 			if upRate >= float64(config.RateWarnUpMBps) && config.RateWarnUpMBps > 0 {
 				log.Printf("[RATE-WARN] uid=%d ip=%s up=%.2f MB/s ih=%s", p.UserID, ip, upRate, hashHex(p.Torrent))
 			}
@@ -218,7 +275,7 @@ func applyStats(
 		return
 	}
 
-	// --- Deltas (real + counted) ---
+	// 4) Deltas (real + counted). PHP only counts deltas when we have a prev.
 	var addUpReal, addDownReal uint64
 	var addUpCounted, addDownCounted uint64
 	if prev != nil && uploaded > prev.Uploaded {
@@ -230,7 +287,7 @@ func applyStats(
 		addDownCounted = addDownReal * uint64(config.DownloadMultiplier)
 	}
 
-	// --- Section split (seed upload) ---
+	// 5) Section split for seed upload
 	var nyttSeed, arkivSeed uint64
 	if ts.Section == "new" {
 		nyttSeed = addUpCounted
@@ -238,7 +295,7 @@ func applyStats(
 		arkivSeed = addUpCounted
 	}
 
-	// --- FREELEECH rules (sitewide / per-torrent / 24h) ---
+	// 6) FREELEECH rules: sitewide/per-torrent/24h + force for new/archive (matches your PHP)
 	isFL := false
 	if config.ForceFLNewAndArchive && (ts.Section == "new" || ts.Section == "archive") {
 		isFL = true
@@ -253,6 +310,7 @@ func applyStats(
 		isFL = true
 	}
 	if isFL {
+		// Counted DL is zero, but we still store REAL DL in snatch (PHP uses add_down2 there)
 		addDownCounted = 0
 	} else {
 		procent := float64(100-extra.LeechBonus) / 100.0
@@ -262,29 +320,31 @@ func applyStats(
 		addDownCounted = uint64(float64(addDownCounted) * procent)
 	}
 
-	// --- Hidden IP for high class ---
+	// 7) Hidden IP for high class
 	dip := ip
 	if extra.Class >= 50 {
 		dip = "Hidden IP"
 	}
 
-	// --- Update user stats (users table) ---
+	// 8) Users table (only when we have real deltas)
 	if (addUpReal | addDownReal) > 0 {
-		_ = db.UpdateUserStats(p.UserID, addUpCounted, addUpReal, addDownCounted, addDownReal, nyttSeed, arkivSeed, dip)
+		_ = db.UpdateUserStats(
+			p.UserID,
+			addUpCounted,  // uploaded (counted)
+			addUpReal,     // uploaded_real
+			addDownCounted, // downloaded (counted; may be 0 due to FL)
+			addDownReal,    // downloaded_real
+			nyttSeed, arkivSeed,
+			dip,
+		)
 	}
 
-	// --- Torrent + snatch updates require torrentID ---
-	torrentID := ts.ID
-	if torrentID <= 0 {
-		return
-	}
-
-	// HnR clear while seeding
+	// 9) HnR clear if seeding
 	if seeder {
-		db.ClearHnRIfSeeding(p.UserID, torrentID)
+		db.ClearHnRIfSeeding(p.UserID, ts.ID)
 	}
 
-	// Determine counters like PHP
+	// 10) Counters like PHP
 	timesStarted, timesCompleted, timesUpdated, timesStopped := 0, 0, 0, 0
 	switch event {
 	case "started":
@@ -303,45 +363,29 @@ func applyStats(
 		timesUpdated = 1
 	}
 
-// Seedtime delta: seconds since previous announce (only when seeding)
-var seedtimeDelta int64
-if prev != nil {
-    dt := nowUnix() - prev.LastAction
-    if dt > 0 && seeder {
-        seedtimeDelta = dt
-    }
-}
-
-// Fallback: if prev is nil (e.g., just restarted after a stop), use snatch.lastaction
-if seedtimeDelta == 0 && seeder && prev == nil {
-    if lastAct, ok := db.GetSnatchLastAction(p.UserID, ts.ID); ok && !lastAct.IsZero() {
-        if dt := time.Now().Sub(lastAct); dt > 0 {
-            // clamp absurd gaps (e.g., if client was offline for days)
-            // adjust or remove the clamp to your taste
-            if dt > 24*time.Hour {
-                dt = 24 * time.Hour
-            }
-            seedtimeDelta = int64(dt.Seconds())
-        }
-    }
-}
-
-
-	// On "completed" bump torrents + finishedat
+	// 11) Completed bump (seeders++, leechers--, times_completed++)
 	if timesCompleted == 1 {
-		_ = db.OnCompleted(torrentID, p.UserID)
+		_ = db.OnCompleted(ts.ID, p.UserID)
 	}
 
-	// Upsert snatch (update or insert), include uploaded/downloaded REAL deltas
+	// 12) Upsert snatch: store REAL deltas in snatch.uploaded/downloaded (PHP parity)
 	_ = db.UpsertSnatch(
-		p.UserID, torrentID,
+		p.UserID, ts.ID,
 		ip, port, agent,
 		p.Connectable,
 		timesStarted, timesCompleted, timesUpdated, timesStopped,
-		addUpReal, addDownReal,
-		seedtimeDelta,
+		addUpReal, addDownReal, // REAL deltas go to snatch
+		seeder,
 	)
 }
+
+
+
+
+
+
+
+
 
 /* ---------- SCRAPE ---------- */
 
@@ -514,4 +558,68 @@ func clampNumwant(s string) int {
 		want = 0
 	}
 	return want
+}
+
+
+// parseInfoHashLoose replicates PHP-style tolerance:
+//
+// 1) Try the strict parser you had (percent-decoded/hex -> 20 bytes).
+// 2) If that fails, extract the raw value from RawQuery so '+' isn't turned into space,
+//    replace '+' with "%2B", unescape once, and accept if it yields 20 bytes.
+// 3) If still not 20, accept a 40-hex string (case-insensitive) and decode to 20 bytes.
+func parseInfoHashLoose(r *http.Request) ([]byte, bool) {
+	// 1) your existing strict path
+	if b, ok := parse20(r.URL.Query().Get("info_hash")); ok {
+		return b, true
+	}
+
+	raw := r.URL.RawQuery
+	if raw == "" {
+		return nil, false
+	}
+
+	// 2) pull the exact info_hash value from RawQuery to avoid '+' => ' ' conversion
+	var enc string
+	for i := 0; i < len(raw); {
+		j := strings.IndexByte(raw[i:], '&')
+		item := raw[i:]
+		if j >= 0 {
+			item = raw[i : i+j]
+		}
+		if strings.HasPrefix(item, "info_hash=") {
+			enc = item[len("info_hash="):]
+			break
+		}
+		if j < 0 {
+			break
+		}
+		i += j + 1
+	}
+	if enc == "" {
+		return nil, false
+	}
+
+	// Treat literal '+' as "%2B" before unescape (PHP would not auto-space it for this field)
+	enc = strings.ReplaceAll(enc, "+", "%2B")
+
+	// Try single unescape
+	if dec, err := url.QueryUnescape(enc); err == nil {
+		if len(dec) == 20 {
+			return []byte(dec), true
+		}
+		// Also allow 40-char hex after one decode (some old torrents stored as hex)
+		if len(dec) == 40 && isHex(dec) {
+			if b, err := hex.DecodeString(dec); err == nil && len(b) == 20 {
+				return b, true
+			}
+		}
+	}
+
+	// Final fallback: if the raw value itself looks like hex
+	if len(enc) == 40 && isHex(enc) {
+		if b, err := hex.DecodeString(enc); err == nil && len(b) == 20 {
+			return b, true
+		}
+	}
+	return nil, false
 }

@@ -54,22 +54,22 @@ func EnqueueProbe(p *Peer) {
 }
 
 func probeWorker(db *DB, store *PeerStore) {
-	for p := range probeCh {
-		addr := net.JoinHostPort(p.IP, itoa(p.Port))
-		c, err := net.DialTimeout("tcp", addr, probeTimeout)
-		ok := err == nil
-		if ok {
-			_ = c.Close()
-		}
-		// update memory
-		p.Connectable = ok
-		// and DB if writes enabled
-		if !config.SafeMode {
-			if err := db.UpdatePeerConnectable(p, ok); err != nil && config.LogVerbose {
-				log.Printf("[PROBE] update connectable failed for %s: %v", addr, err)
-			}
-		}
-	}
+    for p := range probeCh {
+        addr := net.JoinHostPort(p.IP, itoa(p.Port))
+        c, err := net.DialTimeout("tcp", addr, probeTimeout)
+        ok := err == nil
+        if ok { _ = c.Close() }
+
+        // update memory (the stored copy)
+        store.SetConnectable(p.Torrent, p.PeerID, ok)
+
+        if config.SafeMode { continue }
+
+        // try to update; if 0 rows affected, wait briefly and retry once
+        if err := db.UpdatePeerConnectable(p, ok); err != nil {
+            if config.LogVerbose { log.Printf("[PROBE] update connectable failed for %s: %v", addr, err) }
+        }
+    }
 }
 
 // tiny helpers

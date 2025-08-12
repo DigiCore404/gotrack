@@ -19,6 +19,25 @@ var (
 	ipRules      *IPRules      // dynamic IP bans
 )
 
+func startPeerPurger(store *PeerStore, db *DB, cfg *Config) {
+	if cfg.PeerTTLSeconds <= 0 || cfg.PeerPurgeIntervalSec <= 0 {
+		return
+	}
+	t := time.NewTicker(time.Duration(cfg.PeerPurgeIntervalSec) * time.Second)
+	go func() {
+		for range t.C {
+			removed := store.PurgeStale(int64(cfg.PeerTTLSeconds), func(p *Peer) {
+				if cfg.PurgeDBOnExpire && !cfg.SafeMode {
+					_ = db.DeletePeer(p)
+				}
+			})
+			if removed > 0 && cfg.LogVerbose {
+				log.Printf("[PURGE] removed %d stale peers (TTL=%ds)", removed, cfg.PeerTTLSeconds)
+			}
+		}
+	}()
+}
+
 
 func main() {
 	var err error
@@ -83,6 +102,9 @@ func main() {
 
 	// Start connectable prober (async)
 	StartConnectProber(db, peerStore)
+
+// Start stale peer purger (evicts old rows and, optionally, DB)
+startPeerPurger(peerStore, db, config)
 
 	// Graceful shutdown
 	sigs := make(chan os.Signal, 1)
