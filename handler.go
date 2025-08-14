@@ -83,10 +83,6 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		BencodeError(w, "Account disabled")
 		return
 	}
-	if user.DownloadBan {
-		BencodeError(w, "Download banned")
-		return
-	}
 
 	// after parseInfoHashLoose:
 	inf, ok := parseInfoHashLoose(r)
@@ -121,7 +117,7 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 	event := r.URL.Query().Get("event")
 	numwant := clampNumwant(r.URL.Query().Get("numwant"))
 
-	seeder := left == 0
+	seeder := left == 0 || event == "completed"
 
 	var tHash, pID [20]byte
 	copy(tHash[:], inf)
@@ -172,6 +168,27 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+
+// ---- Allow seeding/stopped for download-banned users, block leeching ----
+if user.DownloadBan {
+    // allow announces that are clearly not downloading:
+    // - seeding (left==0)
+    // - stopping (event == "stopped") so we can clean up
+    if seeder || event == "stopped" {
+        if config.DebugAnnounce {
+            log.Printf("[ANNOUNCE INFO] uid=%d is download-banned but allowed (seeder=%t event=%q)", user.ID, seeder, event)
+        }
+        // proceed
+    } else {
+        if config.DebugAnnounce {
+            log.Printf("[ANNOUNCE REJECT] uid=%d download-banned and attempting to leech (left=%d event=%q) ip=%s qs=%q",
+                user.ID, left, event, ip, r.URL.RawQuery)
+        }
+        BencodeError(w, "Download banned — you may seed only to clear HnR.")
+        return
+    }
+}
+
 	interval := rand.Intn(config.AnnounceIntervalMax-config.AnnounceIntervalMin+1) + config.AnnounceIntervalMin
 
 	// Stats + snatch updates
@@ -179,55 +196,34 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		applyStats(r, peer, uploaded, downloaded, seeder, ip, port, r.UserAgent(), event, prev)
 	}
 
-// DB peer write (async)
-if !config.SafeMode {
-	if event == "stopped" {
-		// delete peer + recount off the hot path
-		ihHex := hex.EncodeToString(tHash[:])
-		EnqueueDB(func(d *DB) {
-			if err := d.DeletePeer(peer); err != nil {
-				log.Printf("[DBQ] DeletePeer error: %v", err)
-			}
-			_ = db.RecountTorrentCountsByHash(ihHex)
-		})
-	} else {
-		// upsert peer + recount off the hot path
-		ihHex := hex.EncodeToString(tHash[:])
-		uid := user.ID
-		ua := r.UserAgent()
-		leftC := left
-		seed := seeder
-		conn := peer.Connectable
-		frl := peer.Frileech
-		ev := event
 
-		EnqueueDB(func(d *DB) {
-			if err := d.UpsertPeer(peer, uid, ua, leftC, seed, conn, frl, ev); err != nil {
-				// ------ EXTRA DEBUG CONTEXT ------
-				var tid int
-				section := ""
-				var tsize uint64
-				if ts, ok := torrentStats.Get(tHash); ok {
-					tid = ts.ID
-					section = ts.Section
-					tsize = ts.Size
-				}
-				extra, _ := d.GetUserExtra(uid)
-				log.Printf(
-					"[DB] UpsertPeer failed: %v | ih=%s tid=%d section=%s size=%d | userID=%d enabled=%t dlban=%t class=%d leechbonus=%d | passkey=%s | event=%q left=%d seeder=%t conn=%t ip=%s port=%d ua=%q",
-					err,
-					ihHex, tid, section, tsize,
-					user.ID, user.Enabled, user.DownloadBan, extra.Class, extra.LeechBonus,
-					maskPasskey(user.Passkey),
-					ev, leftC, seed, conn, peer.IP, peer.Port, ua,
-				)
-				// ---------------------------------
-			} else {
-				_ = db.RecountTorrentCountsByHash(ihHex)
-			}
-		})
-	}
+// DB peer write (sync)
+if !config.SafeMode {
+    ihHex := hex.EncodeToString(tHash[:])
+    if event == "stopped" {
+        if err := db.DeletePeer(peer); err != nil {
+            log.Printf("[DB] DeletePeer error: %v", err)
+        }
+        _ = db.RecountTorrentCountsByHash(ihHex)
+    } else {
+        if err := db.UpsertPeer(
+            peer,
+            user.ID,
+            r.UserAgent(),
+            left,
+            seeder,
+            peer.Connectable,
+            peer.Frileech,
+            event,
+        ); err != nil {
+            log.Printf("[DB] UpsertPeer error: %v ih=%s ip=%s port=%d uid=%d",
+                err, ihHex, peer.IP, peer.Port, user.ID)
+        } else {
+            _ = db.RecountTorrentCountsByHash(ihHex)
+        }
+    }
 }
+
 
 	// enqueue the probe *after* the peer row exists
 	if event != "stopped" {

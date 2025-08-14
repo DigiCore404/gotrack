@@ -8,99 +8,13 @@ import (
 	"time"
 	mysql "github.com/go-sql-driver/mysql"
 	"net"
-    "sync/atomic"
-
+       "strings"
 )
 
 type DB struct {
 	db       *sql.DB
 	readOnly bool
 }
-
-
-
-
-
-
-
-
-
-// ---- async DB write queue ----
-type dbJob interface{ run(*DB) }
-type dbFunc func(*DB)
-func (f dbFunc) run(d *DB) { f(d) }
-
-var (
-	writeQ         chan dbJob
-	writeQClosed   = make(chan struct{}) // indicates "started" after close
-	lastDBQWarnSec int64
-)
-
-// Start a fixed number of DB workers and a big buffered queue.
-// Call this once from main() after InitDB.
-func StartDBWorkers(d *DB, workers int, queueSize int) {
-	if workers <= 0 {
-		workers = 12
-	}
-	if queueSize <= 0 {
-		queueSize = 200_000
-	}
-	writeQ = make(chan dbJob, queueSize)
-	for i := 0; i < workers; i++ {
-		go func() {
-			for job := range writeQ {
-				func() { // protect worker from panics
-					defer func() { _ = recover() }()
-					job.run(d)
-				}()
-			}
-		}()
-	}
-	close(writeQClosed) // signal "started"
-}
-
-// Non-blocking enqueue with tiny wait; if saturated, run synchronously.
-// This guarantees we DO NOT DROP work.
-func EnqueueDB(f dbFunc) {
-	// Fast path: queue has room
-	select {
-	case writeQ <- f:
-		return
-	default:
-	}
-
-	// Brief grace period (reduces sync fallback under bursts)
-	t := time.NewTimer(3 * time.Millisecond)
-	select {
-	case writeQ <- f:
-		if !t.Stop() {
-			<-t.C
-		}
-		return
-	case <-t.C:
-		// fall through
-	}
-
-	// No room: execute synchronously to avoid data loss
-	// 'db' is the package-level *DB set in main.go
-	if db != nil {
-		f(db)
-	} else {
-		// extreme fallback: run on a goroutine (still not dropped)
-		go f(db)
-	}
-
-	// Rate-limit the warning (once every 5s)
-	now := time.Now().Unix()
-	if atomic.LoadInt64(&lastDBQWarnSec)+5 <= now {
-		atomic.StoreInt64(&lastDBQWarnSec, now)
-		log.Printf("[DBQ] saturated; ran job synchronously (queue=%d)", len(writeQ))
-	}
-}
-
-
-
-
 
 
 // Only prints MySQL driver logs when config.DebugAnnounce is true
@@ -306,7 +220,7 @@ func (d *DB) LoadPeers(ps *PeerStore) error {
 			Port:        int(port),
 			Uploaded:    uploaded,
 			Downloaded:  downloaded,
-			Seeder:      seederStr == "yes",
+			Seeder:      asYes(seederStr),
 			LastAction:  lastAction.Unix(),
 			Connectable: connectable == 1,
 			Frileech:    frileech == 1,
@@ -430,6 +344,14 @@ func (d *DB) LoadSitewideFreeleech() (bool, error) {
 func max64(a, b int64) int64 {
 	if a > b { return a }
 	return b
+}
+
+
+// asYes returns true for common “true” string-ish values.
+// Handles ENUM('yes','no') as well as accidental 1/0 or TRUE/FALSE.
+func asYes(s string) bool {
+	s = strings.TrimSpace(strings.ToLower(s))
+	return s == "yes" || s == "y" || s == "1" || s == "true"
 }
 
 
@@ -637,6 +559,11 @@ func (d *DB) UpsertPeer(
 		log.Printf("[UpsertPeer] pre-check seeder scan err ih=%s ip=%s port=%d err=%v", ihHex, p.IP, p.Port, err)
 	}
 
+if event == "completed" {
+    toGo = 0
+}
+
+
 	// ---- UPDATE (no DB-side speed math, do NOT touch offsets here) ----
 	qUpdate := `
 UPDATE peers
@@ -769,13 +696,15 @@ func (d *DB) DeletePeer(p *Peer) error {
 	}
 
 	// Decrement the torrent counts if we knew the row we deleted
-	if tID > 0 {
-		if seederStr == "yes" {
-			_, _ = d.db.Exec(`UPDATE torrents SET seeders = GREATEST(seeders - 1, 0) WHERE id = ?`, tID)
-		} else {
-			_, _ = d.db.Exec(`UPDATE torrents SET leechers = GREATEST(leechers - 1, 0) WHERE id = ?`, tID)
-		}
-	}
+
+if tID > 0 {
+    if asYes(seederStr) {
+        _, _ = d.db.Exec(`UPDATE torrents SET seeders = GREATEST(seeders - 1, 0) WHERE id = ?`, tID)
+    } else {
+        _, _ = d.db.Exec(`UPDATE torrents SET leechers = GREATEST(leechers - 1, 0) WHERE id = ?`, tID)
+    }
+}
+
 
 	return nil
 }

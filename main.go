@@ -55,11 +55,6 @@ func main() {
 	}
 	log.Println("[DB] Connected")
 
-	// ---- Start async DB workers BEFORE serving traffic ----
-	StartDBWorkers(db, 48, 600_000)
-	// ------------------------------------------------------------------------
-
-
 	// In-memory peer store
 	peerStore = NewPeerStore()
 
