@@ -6,14 +6,100 @@ import (
 	"fmt"
 	"log"
 	"time"
-	"net"
 	mysql "github.com/go-sql-driver/mysql"
+	"net"
+    "sync/atomic"
+
 )
 
 type DB struct {
 	db       *sql.DB
 	readOnly bool
 }
+
+
+
+
+
+
+
+
+
+// ---- async DB write queue ----
+type dbJob interface{ run(*DB) }
+type dbFunc func(*DB)
+func (f dbFunc) run(d *DB) { f(d) }
+
+var (
+	writeQ         chan dbJob
+	writeQClosed   = make(chan struct{}) // indicates "started" after close
+	lastDBQWarnSec int64
+)
+
+// Start a fixed number of DB workers and a big buffered queue.
+// Call this once from main() after InitDB.
+func StartDBWorkers(d *DB, workers int, queueSize int) {
+	if workers <= 0 {
+		workers = 12
+	}
+	if queueSize <= 0 {
+		queueSize = 200_000
+	}
+	writeQ = make(chan dbJob, queueSize)
+	for i := 0; i < workers; i++ {
+		go func() {
+			for job := range writeQ {
+				func() { // protect worker from panics
+					defer func() { _ = recover() }()
+					job.run(d)
+				}()
+			}
+		}()
+	}
+	close(writeQClosed) // signal "started"
+}
+
+// Non-blocking enqueue with tiny wait; if saturated, run synchronously.
+// This guarantees we DO NOT DROP work.
+func EnqueueDB(f dbFunc) {
+	// Fast path: queue has room
+	select {
+	case writeQ <- f:
+		return
+	default:
+	}
+
+	// Brief grace period (reduces sync fallback under bursts)
+	t := time.NewTimer(3 * time.Millisecond)
+	select {
+	case writeQ <- f:
+		if !t.Stop() {
+			<-t.C
+		}
+		return
+	case <-t.C:
+		// fall through
+	}
+
+	// No room: execute synchronously to avoid data loss
+	// 'db' is the package-level *DB set in main.go
+	if db != nil {
+		f(db)
+	} else {
+		// extreme fallback: run on a goroutine (still not dropped)
+		go f(db)
+	}
+
+	// Rate-limit the warning (once every 5s)
+	now := time.Now().Unix()
+	if atomic.LoadInt64(&lastDBQWarnSec)+5 <= now {
+		atomic.StoreInt64(&lastDBQWarnSec, now)
+		log.Printf("[DBQ] saturated; ran job synchronously (queue=%d)", len(writeQ))
+	}
+}
+
+
+
 
 
 
@@ -87,9 +173,12 @@ func InitDB(cfg DBConfig) (*DB, error) {
 		return nil, err
 	}
 	// Pool sizing
-	db.SetMaxOpenConns(80)
-	db.SetMaxIdleConns(40)
-	db.SetConnMaxLifetime(30 * time.Minute)
+
+db.SetMaxOpenConns(48)        // total parallel MySQL conns allowed
+db.SetMaxIdleConns(48)        // keep same as open for reuse
+db.SetConnMaxLifetime(2 * time.Minute)  // rotate conns to avoid long-lived
+
+
 	return &DB{db: db, readOnly: false}, nil
 }
 
@@ -362,6 +451,10 @@ func (d *DB) UpsertSnatch(
 	if connectable {
 		connInt = 1
 	}
+	seederInt := 0
+	if seeder {
+		seederInt = 1
+	}
 
 	if config.DebugAnnounce {
 		log.Printf("[UpsertSnatch] uid=%d tid=%d ip=%s port=%d agent=%s conn=%d seeder=%v addUp=%d addDown=%d",
@@ -388,7 +481,7 @@ func (d *DB) UpsertSnatch(
     `,
 		timesStarted, timesCompleted, timesUpdated, timesStopped,
 		addUp, addDown,
-		seeder,
+		seederInt,
 		connInt,
 		ip, port, agent,
 		userID, torrentID,
@@ -407,9 +500,9 @@ func (d *DB) UpsertSnatch(
 		return nil
 	}
 
-	// INSERT if no row (starts with seedtime 0)
+	// INSERT if no row — ON DUP to survive races and guarantee presence
 	if config.DebugAnnounce {
-		log.Printf("[UpsertSnatch] No existing row, inserting new snatch for uid=%d tid=%d", userID, torrentID)
+		log.Printf("[UpsertSnatch] No existing row, inserting/merging snatch for uid=%d tid=%d", userID, torrentID)
 	}
 	_, err = d.db.Exec(`
         INSERT INTO snatch (
@@ -423,6 +516,18 @@ func (d *DB) UpsertSnatch(
             ?, ?, ?, ?,
             ?, ?, 0, 'no', 'no', 'no', 'no'
         )
+        ON DUPLICATE KEY UPDATE
+            ip = VALUES(ip),
+            port = VALUES(port),
+            agent = VALUES(agent),
+            connectable = VALUES(connectable),
+            lastaction = VALUES(lastaction),
+            timesStarted   = timesStarted   + VALUES(timesStarted),
+            timesCompleted = timesCompleted + VALUES(timesCompleted),
+            timesUpdated   = timesUpdated   + VALUES(timesUpdated),
+            timesStopped   = timesStopped   + VALUES(timesStopped),
+            uploaded       = uploaded       + VALUES(uploaded),
+            downloaded     = downloaded     + VALUES(downloaded)
     `,
 		userID, torrentID, ip, port, agent, connInt,
 		timesStarted, timesCompleted, timesUpdated, timesStopped,
@@ -430,29 +535,36 @@ func (d *DB) UpsertSnatch(
 	)
 	if err != nil {
 		if config.DebugAnnounce {
-			log.Printf("[UpsertSnatch] INSERT error: %v", err)
+			log.Printf("[UpsertSnatch] INSERT/ON DUP error: %v", err)
 		}
 		return err
 	}
 
 	if config.DebugAnnounce {
-		log.Printf("[UpsertSnatch] Inserted new snatch row for uid=%d tid=%d", userID, torrentID)
+		log.Printf("[UpsertSnatch] Inserted/merged snatch row for uid=%d tid=%d", userID, torrentID)
 	}
 	return nil
 }
 
 
-
-
-func (d *DB) UpsertPeer(p *Peer, userID int, agent string, toGo uint64, seeder bool, connectable bool, frileech bool) error {
+func (d *DB) UpsertPeer(
+	p *Peer,
+	userID int,
+	agent string,
+	toGo uint64,
+	seeder bool,
+	connectable bool, // current flag from memory; we also try a quick dial below
+	frileech bool,
+	event string,
+) error {
 	if d.readOnly {
 		return nil
 	}
 
-	// quick TCP dial so "connectable" is visible immediately
+	// --- quick TCP dial so "connectable" is visible immediately (keep this)
 	connInt := 0
 	addr := net.JoinHostPort(p.IP, fmt.Sprintf("%d", p.Port))
-	if c, err := net.DialTimeout("tcp", addr, 1*time.Second); err == nil {
+	if c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err == nil {
 		connInt = 1
 		_ = c.Close()
 	}
@@ -468,16 +580,17 @@ func (d *DB) UpsertPeer(p *Peer, userID int, agent string, toGo uint64, seeder b
 		frlInt = 1
 	}
 
-	// 6-byte compact (IPv4). Fallback to zeros to satisfy NOT NULL.
+	// 6-byte compact (IPv4) fallback to zeros to satisfy NOT NULL
 	cmp := CompactPeer(p)
 	if cmp == nil || len(cmp) != 6 {
 		cmp = make([]byte, 6)
 	}
 
-	// Torrent meta (cache → DB fallback)
+	// ---- Torrent meta (cache → DB fallback) ----
 	var tID int
 	section := "new"
 	var tSize uint64 = 1
+
 	if ts, ok := torrentStats.Get(p.Torrent); ok {
 		tID = ts.ID
 		if ts.Section == "new" || ts.Section == "archive" {
@@ -487,82 +600,89 @@ func (d *DB) UpsertPeer(p *Peer, userID int, agent string, toGo uint64, seeder b
 			tSize = ts.Size
 		}
 	} else {
-		_ = d.db.QueryRow(`SELECT id, section, size FROM torrents WHERE info_hash=? LIMIT 1`,
-			ihHex).Scan(&tID, &section, &tSize)
+		if err := d.db.QueryRow(`SELECT id, section, size FROM torrents WHERE info_hash=? LIMIT 1`,
+			ihHex).Scan(&tID, &section, &tSize); err != nil {
+			if config.DebugAnnounce {
+				log.Printf("[ANNOUNCE PEERS] meta DB scan ih=%s err=%v", ihHex, err)
+			}
+		}
 	}
 
-	// ---------- UPDATE first (compute speed from existing offsets) ----------
-	// Unique key is (port, ip, info_hash).
-	// We compute speed from the *previous* offsets and last_action,
-	// then advance offsets to the new totals atomically.
-	const qUpdate = `
+	// see what we resolved
+	if config.DebugAnnounce {
+		log.Printf("[ANNOUNCE PEERS] meta lookup ih=%s -> tID=%d section=%s size=%d", ihHex, tID, section, tSize)
+	}
+
+	if tID == 0 {
+		if config.DebugAnnounce {
+			log.Printf("[ANNOUNCE PEERS] unregistered torrent ih=%s (refusing to insert with tID=0)", ihHex)
+		}
+		return fmt.Errorf("unregistered torrent")
+	}
+
+	// ---- finishedat gate like your PHP, but also handle "arrive-as-seeder" case ----
+	shouldSetFinished := false
+	var seederDB string
+	if err := d.db.QueryRow(
+		`SELECT seeder FROM peers WHERE port=? AND ip=? AND info_hash=? LIMIT 1`,
+		p.Port, p.IP, ihHex,
+	).Scan(&seederDB); err == nil {
+		// transition no->yes, or client sends explicit completed
+		if seeder && seederDB == "no" {
+			shouldSetFinished = true
+		} else if event == "completed" && seeder {
+			shouldSetFinished = true
+		}
+	} else if err != sql.ErrNoRows && config.DebugAnnounce {
+		log.Printf("[UpsertPeer] pre-check seeder scan err ih=%s ip=%s port=%d err=%v", ihHex, p.IP, p.Port, err)
+	}
+
+	// ---- UPDATE (no DB-side speed math, do NOT touch offsets here) ----
+	qUpdate := `
 UPDATE peers
    SET uploaded    = ?,
        downloaded  = ?,
        to_go       = ?,
        seeder      = ?,
-
-       -- bits per second; guard underflows and zero elapsed
-mbitupp = CASE
-            WHEN TIMESTAMPDIFF(SECOND, last_action, NOW()) > 0
-            THEN GREATEST(
-                   0.0,
-                   (CASE WHEN ? >= uploadoffset THEN (? - uploadoffset) ELSE 0 END) * 8.0
-                   / (TIMESTAMPDIFF(SECOND, last_action, NOW()) * 1.0)
-                 )
-            ELSE mbitupp
-          END,
-mbitner = CASE
-            WHEN TIMESTAMPDIFF(SECOND, last_action, NOW()) > 0
-            THEN GREATEST(
-                   0.0,
-                   (CASE WHEN ? >= downloadoffset THEN (? - downloadoffset) ELSE 0 END) * 8.0
-                   / (TIMESTAMPDIFF(SECOND, last_action, NOW()) * 1.0)
-                 )
-            ELSE mbitner
-          END,
-
-       uploadoffset   = ?,         -- advance offsets AFTER using them
-       downloadoffset = ?,
-       last_action    = NOW(),
-       connectable    = ?,
-       userid         = ?,
-       agent          = ?,
-       frileech       = ?,
-       section        = ?,
-       torrentsize    = ?
+       last_action = NOW(),
+       ip          = ?,
+       connectable = ?,
+       userid      = ?,
+       agent       = ?,
+       frileech    = ?,
+       section     = ?,
+       torrentsize = ?`
+	if shouldSetFinished {
+		qUpdate += `, finishedat = UNIX_TIMESTAMP(NOW())`
+	}
+	qUpdate += `
  WHERE port = ? AND ip = ? AND info_hash = ?`
 
 	res, err := d.db.Exec(qUpdate,
-		// set totals
 		p.Uploaded, p.Downloaded, toGo, seederStr,
-		// speed calc args: use current totals against previous offsets
-		p.Uploaded, p.Uploaded,
-		p.Downloaded, p.Downloaded,
-		// advance offsets
-		p.Uploaded, p.Downloaded,
-		// misc
-		connInt, userID, agent, frlInt, section, tSize,
-		// WHERE key
+		p.IP, connInt, userID, agent, frlInt, section, tSize,
 		p.Port, p.IP, ihHex,
 	)
-	if err != nil {
-		if config.DebugAnnounce {
-			log.Printf("[UpsertPeer][UPDATE] err=%v ih=%s ip=%s port=%d up=%d down=%d left=%d seed=%s",
-				err, ihHex, p.IP, p.Port, p.Uploaded, p.Downloaded, toGo, seederStr)
+	if err != nil && config.DebugAnnounce {
+		log.Printf("[UpsertPeer][UPDATE] err=%v ih=%s ip=%s port=%d", err, ihHex, p.IP, p.Port)
+	}
+	if err == nil {
+		if aff, _ := res.RowsAffected(); aff > 0 {
+			if config.DebugAnnounce {
+				log.Printf("[UpsertPeer][UPDATE] ok ih=%s ip=%s port=%d uid=%d seed=%s conn=%d",
+					ihHex, p.IP, p.Port, userID, seederStr, connInt)
+			}
+			return nil
 		}
-		// fall through to INSERT attempt anyway
 	}
 
-	if aff, _ := res.RowsAffected(); aff > 0 {
-		if config.DebugAnnounce {
-			log.Printf("[UpsertPeer][UPDATE] ok ih=%s ip=%s port=%d uid=%d tID=%d seed=%s conn=%d",
-				ihHex, p.IP, p.Port, userID, tID, seederStr, connInt)
-		}
-		return nil
+	// ---- INSERT (initialize offsets ONCE like your PHP)
+	// KEY FIX: if peer arrives as seeder (left==0), set finishedat NOW at INSERT.
+	finishedAt := int64(0)
+	if seeder {
+		finishedAt = time.Now().Unix()
 	}
 
-	// ---------- No existing row → INSERT (first announce; speed will be 0 this time) ----------
 	const qInsert = `
 INSERT INTO peers
   (info_hash, torrent, peer_id, ip, compact, port,
@@ -573,15 +693,23 @@ INSERT INTO peers
 VALUES
   (?, ?, ?, ?, ?, ?,
    ?, ?, ?, ?,
-   NOW(), NOW(), ?, ?, ?, 0,
+   NOW(), NOW(), ?, ?, ?, ?,
    ?, ?, ?, 0, 0, 0,
-   ?, 0, ?, NOW())`
+   ?, 0, ?, NOW())
+ON DUPLICATE KEY UPDATE
+  last_action = NOW(),
+  port        = VALUES(port),
+  ip          = VALUES(ip),
+  userid      = VALUES(userid),
+  agent       = VALUES(agent),
+  seeder      = VALUES(seeder),
+  connectable = VALUES(connectable)`
 
 	_, err = d.db.Exec(qInsert,
 		ihHex, tID, p.PeerID[:], p.IP, cmp, p.Port,
 		p.Uploaded, p.Downloaded, toGo, seederStr,
-		connInt, userID, agent,
-		// init offsets with the current totals; next announce will have deltas
+		connInt, userID, agent, finishedAt,
+		// initialize offsets at first sight — do NOT update them later
 		p.Downloaded, p.Uploaded,
 		frlInt,
 		section, tSize,
@@ -593,48 +721,31 @@ VALUES
 		return err
 	}
 	if config.DebugAnnounce {
-		log.Printf("[UpsertPeer][INSERT] ok ih=%s ip=%s port=%d uid=%d tID=%d seed=%s conn=%d",
-			ihHex, p.IP, p.Port, userID, tID, seederStr, connInt)
+		log.Printf("[UpsertPeer][INSERT] ok ih=%s ip=%s port=%d uid=%d tID=%d seed=%s conn=%d finishedat=%d",
+			ihHex, p.IP, p.Port, userID, tID, seederStr, connInt, finishedAt)
 	}
 	return nil
 }
 
 
 
-// RecountTorrentCountsByHash recomputes seeders/leechers from peers for a torrent
+
+
+// RecountTorrentCountsByHash recomputes seeders/leechers from peers and updates torrents.
+// Uses MySQL subqueries in a single UPDATE so it’s consistent and fast.
 func (d *DB) RecountTorrentCountsByHash(ihHex string) error {
-	if d.readOnly || ihHex == "" {
+	if d.readOnly {
 		return nil
 	}
-	var seeders, leechers int
-	// MySQL treats (seeder='yes') as 1/0; safe and fast
-	if err := d.db.QueryRow(`
-		SELECT
-			COALESCE(SUM(seeder='yes'), 0) AS s,
-			COALESCE(SUM(seeder='no') , 0) AS l
-		FROM peers
-		WHERE info_hash = ?
-	`, ihHex).Scan(&seeders, &leechers); err != nil {
-		if config.DebugAnnounce {
-			log.Printf("[Recount] peers scan failed ih=%s: %v", ihHex, err)
-		}
-		return err
-	}
-
-	// Update torrents by hash to avoid needing the id
-	_, err := d.db.Exec(`
-		UPDATE torrents
-		   SET seeders=?, leechers=?, last_action=NOW()
-		 WHERE info_hash = ?
-	`, seeders, leechers, ihHex)
-	if config.DebugAnnounce {
-		log.Printf("[Recount] ih=%s seeders=%d leechers=%d err=%v", ihHex, seeders, leechers, err)
-	}
+	_, err := d.db.Exec(
+		`UPDATE torrents
+		   SET seeders  = (SELECT COUNT(*) FROM peers WHERE info_hash = ? AND seeder = 'yes'),
+		       leechers = (SELECT COUNT(*) FROM peers WHERE info_hash = ? AND seeder = 'no')
+		 WHERE info_hash = ?`,
+		ihHex, ihHex, ihHex,
+	)
 	return err
 }
-
-
-
 
 
 func (d *DB) DeletePeer(p *Peer) error {

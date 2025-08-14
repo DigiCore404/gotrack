@@ -55,6 +55,11 @@ func main() {
 	}
 	log.Println("[DB] Connected")
 
+	// ---- Start async DB workers BEFORE serving traffic ----
+	StartDBWorkers(db, 48, 600_000)
+	// ------------------------------------------------------------------------
+
+
 	// In-memory peer store
 	peerStore = NewPeerStore()
 
@@ -65,14 +70,18 @@ func main() {
 	tCount, pCount, sCount, lCount := peerStore.Counts()
 	log.Printf("[STARTUP] Warm-loaded peers: torrents=%d peers=%d seeders=%d leechers=%d", tCount, pCount, sCount, lCount)
 
-	// Torrent stats cache (from torrents table)
+	// Torrent stats cache (DISABLED preload; rely on on-demand lookups)
 	torrentStats = NewTorrentStats(db)
+	log.Printf("[STARTUP] Torrent stats preload disabled; using on-demand info_hash lookups")
+	/*
+	// Previous preload (disabled):
 	if err := torrentStats.Refresh(); err != nil {
 		log.Printf("[STARTUP] Torrent stats refresh failed: %v", err)
 	} else {
 		log.Printf("[STARTUP] Torrent stats loaded: %d torrents with counts", torrentStats.Count())
 	}
 	go torrentStats.RefreshLoop(5 * time.Minute)
+	*/
 
 	// User cache (only enabled users)
 	userCache = NewUserCache(config.UserCacheTTL, db)
@@ -103,8 +112,8 @@ func main() {
 	// Start connectable prober (async)
 	StartConnectProber(db, peerStore)
 
-// Start stale peer purger (evicts old rows and, optionally, DB)
-startPeerPurger(peerStore, db, config)
+	// Start stale peer purger (evicts old rows and, optionally, DB)
+	startPeerPurger(peerStore, db, config)
 
 	// Graceful shutdown
 	sigs := make(chan os.Signal, 1)
@@ -138,7 +147,8 @@ startPeerPurger(peerStore, db, config)
               IdleTimeout:  120 * time.Second,
        }
 
-       log.Printf("[HTTP] Listening on %s", config.ListenAddr)
-       if err := srv.ListenAndServe(); err != nil { log.Fatal(err) }
-
+	log.Printf("[HTTP] Listening on %s", config.ListenAddr)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
 }

@@ -10,12 +10,31 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"fmt"
+	"bytes"
 )
+
+
+// maskPasskey shows head+tail and hides the middle
+func maskPasskey(pk string) string {
+	if pk == "" {
+		return ""
+	}
+	if len(pk) <= 10 {
+		return "****"
+	}
+	return pk[:6] + "…" + pk[len(pk)-4:]
+}
 
 var announceCount uint64
 
 func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&announceCount, 1)
+
+	if config.DebugAnnounce {
+    		log.Printf("[ANNOUNCE INFO] ip=%s ua=%q path=%s qs=%q",
+        	getRealIP(r), r.UserAgent(), r.URL.Path, r.URL.RawQuery)
+	}
 
 	// Do NOT reject "old protocol" flags (Deluge may send no_peer_id=1)
 	if IsUserAgentBanned(r.UserAgent()) {
@@ -28,16 +47,38 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+
+	if !ipRules.IsAllowed(ip) {
+    		if config.DebugAnnounce {
+        		log.Printf("[ANNOUNCE REJECT] banned IP ip=%s qs=%q", ip, r.URL.RawQuery)
+    		}
+    		BencodeError(w, "Banned IP"); return
+	}
+
 	passkey := r.URL.Query().Get("passkey")
 	if len(passkey) != 32 {
 		BencodeError(w, "Invalid passkey")
 		return
 	}
-	user, ok := userCache.GetOrFetch(passkey)
-	if !ok {
-		BencodeError(w, "Unknown passkey")
-		return
+
+	// after reading passkey:
+	if len(passkey) != 32 {
+    		if config.DebugAnnounce {
+        		log.Printf("[ANNOUNCE REJECT] invalid passkey qs=%q", r.URL.RawQuery)
+    		}
+    		BencodeError(w, "Invalid passkey"); return
 	}
+
+	user, ok := userCache.GetOrFetch(passkey)
+
+	if !ok {
+    		if config.DebugAnnounce {
+        		log.Printf("[ANNOUNCE REJECT] unknown passkey ip=%s qs=%q", ip, r.URL.RawQuery)
+    		}
+    		BencodeError(w, "Unknown passkey"); return
+	}
+
+
 	if !user.Enabled {
 		BencodeError(w, "Account disabled")
 		return
@@ -47,20 +88,25 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// after parseInfoHashLoose:
 	inf, ok := parseInfoHashLoose(r)
-	if !ok {
-		BencodeError(w, "Invalid info hash")
-		return
+
+		if !ok {
+    			if config.DebugAnnounce {
+        			log.Printf("[ANNOUNCE REJECT] invalid info_hash ip=%s qs=%q", ip, r.URL.RawQuery)
+    			}
+    		BencodeError(w, "Invalid info hash"); return
 	}
 
 	pid, ok := parse20(r.URL.Query().Get("peer_id"))
+
 	if !ok {
 		BencodeError(w, "Invalid peer id")
 		return
 	}
 
 	if config.DebugAnnounce {
-		log.Printf("[ANNOUNCE DEBUG] ip=%s passkey=%s rawQS=%q",
+		log.Printf("[ANNOUNCE INFO] ip=%s passkey=%s rawQS=%q",
 			getRealIP(r), passkey, r.URL.RawQuery)
 	}
 
@@ -80,6 +126,15 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 	var tHash, pID [20]byte
 	copy(tHash[:], inf)
 	copy(pID[:], pid)
+
+
+	// ===== DEBUG: prove announce hit for this torrent + params =====
+	if config.DebugAnnounce {
+		ihHex := hashHex(tHash)
+		log.Printf("[ANNOUNCE INFO] ih=%s uid=%d left=%d event=%q ip=%s:%d up=%d down=%d seeder=%t",
+			ihHex, user.ID, left, event, ip, port, uploaded, downloaded, seeder)
+	}
+
 
 	// capture previous snapshot BEFORE we mutate the store
 	prev := peerStore.Get(tHash, pID)
@@ -124,34 +179,55 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		applyStats(r, peer, uploaded, downloaded, seeder, ip, port, r.UserAgent(), event, prev)
 	}
 
-	// DB peer write
-	if !config.SafeMode {
-		if event == "stopped" {
-			if err := db.DeletePeer(peer); err != nil {
-				log.Printf("[DB] DeletePeer error: %v", err)
+// DB peer write (async)
+if !config.SafeMode {
+	if event == "stopped" {
+		// delete peer + recount off the hot path
+		ihHex := hex.EncodeToString(tHash[:])
+		EnqueueDB(func(d *DB) {
+			if err := d.DeletePeer(peer); err != nil {
+				log.Printf("[DBQ] DeletePeer error: %v", err)
 			}
-			// RECOUNT (exact counts from peers → torrents)
-			ihHex := hex.EncodeToString(tHash[:])
 			_ = db.RecountTorrentCountsByHash(ihHex)
-		} else {
-			// UpsertPeer(peer, userID, agent, toGo, seeder, connectable, frileech)
-			if err := db.UpsertPeer(
-				peer,
-				user.ID,
-				r.UserAgent(),
-				left,
-				seeder,
-				peer.Connectable, // current flag; prober may update later
-				peer.Frileech,    // from flManager
-			); err != nil {
-				log.Printf("[DB] UpsertPeer failed: %v", err)
+		})
+	} else {
+		// upsert peer + recount off the hot path
+		ihHex := hex.EncodeToString(tHash[:])
+		uid := user.ID
+		ua := r.UserAgent()
+		leftC := left
+		seed := seeder
+		conn := peer.Connectable
+		frl := peer.Frileech
+		ev := event
+
+		EnqueueDB(func(d *DB) {
+			if err := d.UpsertPeer(peer, uid, ua, leftC, seed, conn, frl, ev); err != nil {
+				// ------ EXTRA DEBUG CONTEXT ------
+				var tid int
+				section := ""
+				var tsize uint64
+				if ts, ok := torrentStats.Get(tHash); ok {
+					tid = ts.ID
+					section = ts.Section
+					tsize = ts.Size
+				}
+				extra, _ := d.GetUserExtra(uid)
+				log.Printf(
+					"[DB] UpsertPeer failed: %v | ih=%s tid=%d section=%s size=%d | userID=%d enabled=%t dlban=%t class=%d leechbonus=%d | passkey=%s | event=%q left=%d seeder=%t conn=%t ip=%s port=%d ua=%q",
+					err,
+					ihHex, tid, section, tsize,
+					user.ID, user.Enabled, user.DownloadBan, extra.Class, extra.LeechBonus,
+					maskPasskey(user.Passkey),
+					ev, leftC, seed, conn, peer.IP, peer.Port, ua,
+				)
+				// ---------------------------------
 			} else {
-				// RECOUNT (exact counts from peers → torrents)
-				ihHex := hex.EncodeToString(tHash[:])
 				_ = db.RecountTorrentCountsByHash(ihHex)
 			}
-		}
+		})
 	}
+}
 
 	// enqueue the probe *after* the peer row exists
 	if event != "stopped" {
@@ -202,14 +278,14 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if config.LogVerbose || config.DebugAnnounce {
+	if config.DebugAnnounce {
 		mode := "normal"
 		if flManager.Sitewide() {
 			mode = "SITEWIDE-FL"
 		} else if peer.Frileech {
 			mode = "FL"
 		}
-		log.Printf("[ANNOUNCE] ip=%s uid=%d event=%q seed=%t ih=%s want=%d peers=%d mode=%s complete=%d incomplete=%d downloaded=%d seedtime+=%ds",
+		log.Printf("[ANNOUNCE INFO] ip=%s uid=%d event=%q seed=%t ih=%s want=%d peers=%d mode=%s complete=%d incomplete=%d downloaded=%d seedtime+=%ds",
 			ip, user.ID, event, seeder, hashHex(tHash), numwant, len(plist), mode, s, l, comp, seedDelta)
 	}
 
@@ -223,6 +299,10 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+
+
+
 func applyStats(
 	r *http.Request,
 	p *Peer,
@@ -234,7 +314,7 @@ func applyStats(
 	event string,
 	prev *Peer, // snapshot captured BEFORE store mutation
 ) {
-	// 1) Load torrent meta, with DB fallback if cache miss (PHP parity)
+	// 1) Load torrent meta, with DB fallback (PHP parity)
 	ts, _ := torrentStats.Get(p.Torrent)
 	if ts.ID == 0 {
 		if meta, err := db.getTorrentMetaByHash(hex.EncodeToString(p.Torrent[:])); err == nil && meta.ID > 0 {
@@ -245,7 +325,6 @@ func applyStats(
 		}
 	}
 	if ts.ID == 0 {
-		// Still no ID? Nothing to update.
 		return
 	}
 
@@ -255,13 +334,13 @@ func applyStats(
 		return
 	}
 
-	// 3) Optional rate-limit logging (same as before)
+	// 3) Optional rate-limit logging
 	skipStats := false
 	if config.RateLimitation && prev != nil && prev.LastAction > 0 {
 		dt := float64(nowUnix() - prev.LastAction)
 		if dt > 0 {
-			upDelta := float64(uploaded - prev.Uploaded) / (1024 * 1024) // MB
-			upRate := upDelta / dt                                        // MB/s
+			upDelta := float64(uploaded - prev.Uploaded) / (1024 * 1024)
+			upRate := upDelta / dt
 			if upRate >= float64(config.RateWarnUpMBps) && config.RateWarnUpMBps > 0 {
 				log.Printf("[RATE-WARN] uid=%d ip=%s up=%.2f MB/s ih=%s", p.UserID, ip, upRate, hashHex(p.Torrent))
 			}
@@ -275,7 +354,7 @@ func applyStats(
 		return
 	}
 
-	// 4) Deltas (real + counted). PHP only counts deltas when we have a prev.
+	// 4) Deltas (real + counted) — only when we have a prev snapshot
 	var addUpReal, addDownReal uint64
 	var addUpCounted, addDownCounted uint64
 	if prev != nil && uploaded > prev.Uploaded {
@@ -295,7 +374,7 @@ func applyStats(
 		arkivSeed = addUpCounted
 	}
 
-	// 6) FREELEECH rules: sitewide/per-torrent/24h + force for new/archive (matches your PHP)
+	// 6) FREELEECH rules
 	isFL := false
 	if config.ForceFLNewAndArchive && (ts.Section == "new" || ts.Section == "archive") {
 		isFL = true
@@ -310,7 +389,6 @@ func applyStats(
 		isFL = true
 	}
 	if isFL {
-		// Counted DL is zero, but we still store REAL DL in snatch (PHP uses add_down2 there)
 		addDownCounted = 0
 	} else {
 		procent := float64(100-extra.LeechBonus) / 100.0
@@ -344,8 +422,11 @@ func applyStats(
 		db.ClearHnRIfSeeding(p.UserID, ts.ID)
 	}
 
-	// 10) Counters like PHP
+	// 10) Counters — treat first sight as a "started" even when event is empty
 	timesStarted, timesCompleted, timesUpdated, timesStopped := 0, 0, 0, 0
+	if prev == nil {
+		timesStarted = 1
+	}
 	switch event {
 	case "started":
 		timesStarted = 1
@@ -363,26 +444,21 @@ func applyStats(
 		timesUpdated = 1
 	}
 
-	// 11) Completed bump (seeders++, leechers--, times_completed++)
+	// 11) Completed bump
 	if timesCompleted == 1 {
 		_ = db.OnCompleted(ts.ID, p.UserID)
 	}
 
-	// 12) Upsert snatch: store REAL deltas in snatch.uploaded/downloaded (PHP parity)
+	// 12) Upsert snatch: store REAL deltas in snatch
 	_ = db.UpsertSnatch(
 		p.UserID, ts.ID,
 		ip, port, agent,
 		p.Connectable,
 		timesStarted, timesCompleted, timesUpdated, timesStopped,
-		addUpReal, addDownReal, // REAL deltas go to snatch
+		addUpReal, addDownReal,
 		seeder,
 	)
 }
-
-
-
-
-
 
 
 
@@ -561,64 +637,125 @@ func clampNumwant(s string) int {
 }
 
 
-// parseInfoHashLoose replicates PHP-style tolerance:
-//
-// 1) Try the strict parser you had (percent-decoded/hex -> 20 bytes).
-// 2) If that fails, extract the raw value from RawQuery so '+' isn't turned into space,
-//    replace '+' with "%2B", unescape once, and accept if it yields 20 bytes.
-// 3) If still not 20, accept a 40-hex string (case-insensitive) and decode to 20 bytes.
-func parseInfoHashLoose(r *http.Request) ([]byte, bool) {
-	// 1) your existing strict path
-	if b, ok := parse20(r.URL.Query().Get("info_hash")); ok {
-		return b, true
-	}
-
-	raw := r.URL.RawQuery
-	if raw == "" {
-		return nil, false
-	}
-
-	// 2) pull the exact info_hash value from RawQuery to avoid '+' => ' ' conversion
-	var enc string
-	for i := 0; i < len(raw); {
-		j := strings.IndexByte(raw[i:], '&')
-		item := raw[i:]
-		if j >= 0 {
-			item = raw[i : i+j]
-		}
-		if strings.HasPrefix(item, "info_hash=") {
-			enc = item[len("info_hash="):]
-			break
-		}
-		if j < 0 {
-			break
-		}
-		i += j + 1
-	}
-	if enc == "" {
-		return nil, false
-	}
-
-	// Treat literal '+' as "%2B" before unescape (PHP would not auto-space it for this field)
-	enc = strings.ReplaceAll(enc, "+", "%2B")
-
-	// Try single unescape
-	if dec, err := url.QueryUnescape(enc); err == nil {
-		if len(dec) == 20 {
-			return []byte(dec), true
-		}
-		// Also allow 40-char hex after one decode (some old torrents stored as hex)
-		if len(dec) == 40 && isHex(dec) {
-			if b, err := hex.DecodeString(dec); err == nil && len(b) == 20 {
-				return b, true
+// Percent-decoder that treats '+' as space (standard form encoding)
+func unescapeInfoHashPlusIsSpace(s string) ([]byte, error) {
+	out := make([]byte, 0, 20)
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '%':
+			if i+2 >= len(s) {
+				return nil, fmt.Errorf("short escape")
 			}
+			v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, byte(v))
+			i += 3
+		case '+':
+			// standard form encoding: '+' means space (0x20)
+			out = append(out, ' ')
+			i++
+		default:
+			out = append(out, s[i])
+			i++
+		}
+	}
+	return out, nil
+}
+
+// Percent-decoder that PRESERVES '+' as literal 0x2B (fallback)
+func unescapeInfoHashPreservePlus(s string) ([]byte, error) {
+	out := make([]byte, 0, 20)
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '%':
+			if i+2 >= len(s) {
+				return nil, fmt.Errorf("short escape")
+			}
+			v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, byte(v))
+			i += 3
+		default:
+			out = append(out, s[i])
+			i++
+		}
+	}
+	return out, nil
+}
+
+// parseInfoHashLoose decodes info_hash from RawQuery without losing '+'
+// Strategy:
+//  1) Extract raw token after "info_hash=" from RawQuery.
+//  2) Decode with '+' preserved as 0x2B (correct for URLs).
+//  3) Also decode with '+' treated as space (form-style fallback).
+//  4) If both are 20 bytes and differ, consult DB: pick the one that exists.
+//  5) Else fall back to any valid 20-byte candidate.
+//  6) Finally, try 40-char hex param as last resort.
+func parseInfoHashLoose(r *http.Request) ([]byte, bool) {
+	raw := r.URL.RawQuery
+
+	// Try percent-encoded binary from RawQuery
+	if i := strings.Index(raw, "info_hash="); i >= 0 {
+		v := raw[i+len("info_hash="):]
+		if j := strings.IndexByte(v, '&'); j >= 0 {
+			v = v[:j]
+		}
+
+		// Variant A: PRESERVE '+' as 0x2B (URL semantics)
+		varA, errA := unescapeInfoHashPreservePlus(v)
+		okA := (errA == nil && len(varA) == 20)
+
+		// Variant B: Treat '+' as SPACE 0x20 (form-encoding fallback)
+		varB, errB := unescapeInfoHashPlusIsSpace(v)
+		okB := (errB == nil && len(varB) == 20)
+
+		switch {
+		case okA && okB:
+			// If they differ, choose the one that exists in DB
+			if !bytes.Equal(varA, varB) {
+				hexA := hex.EncodeToString(varA)
+				hexB := hex.EncodeToString(varB)
+
+				// use the existing meta lookup helper; pick whichever exists
+				if metaA, err := db.getTorrentMetaByHash(hexA); err == nil && metaA.ID > 0 {
+					if config.DebugAnnounce {
+						log.Printf("[ANNOUNCE INFO] ih disambiguation chose PRESERVE-PLUS (ih=%s)", hexA)
+					}
+					return varA, true
+				}
+				if metaB, err := db.getTorrentMetaByHash(hexB); err == nil && metaB.ID > 0 {
+					if config.DebugAnnounce {
+						log.Printf("[ANNOUNCE INFO] ih disambiguation chose PLUS-AS-SPACE (ih=%s)", hexB)
+					}
+					return varB, true
+				}
+
+				// Neither found: prefer PRESERVE-PLUS (safer for URLs)
+				if config.DebugAnnounce {
+					log.Printf("[ANNOUNCE INFO] ih disambiguation: no DB match; defaulting to PRESERVE-PLUS (ih=%s)", hexA)
+				}
+				return varA, true
+			}
+			// Same bytes either way
+			return varA, true
+
+		case okA:
+			return varA, true
+		case okB:
+			return varB, true
 		}
 	}
 
-	// Final fallback: if the raw value itself looks like hex
-	if len(enc) == 40 && isHex(enc) {
-		if b, err := hex.DecodeString(enc); err == nil && len(b) == 20 {
-			return b, true
+	// 40-char hex fallback
+	s := r.URL.Query().Get("info_hash")
+	if len(s) == 40 && isHex(s) {
+		dst := make([]byte, 20)
+		if _, err := hex.Decode(dst, []byte(s)); err == nil {
+			return dst, true
 		}
 	}
 	return nil, false

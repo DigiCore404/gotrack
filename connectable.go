@@ -22,6 +22,15 @@ var (
 	onceStart    sync.Once
 )
 
+
+var probeTokens = make(chan struct{}, 64)
+
+func init() {
+	for i := 0; i < cap(probeTokens); i++ {
+		probeTokens <- struct{}{}
+	}
+}
+
 func StartConnectProber(db *DB, store *PeerStore) {
 	onceStart.Do(func() {
 		probeCh = make(chan *Peer, queueSize)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"sync"
 	"time"
 )
@@ -46,4 +47,35 @@ func (ts *TorrentStats) Count() int {
 	n := len(ts.data)
 	ts.mu.RUnlock()
 	return n
+}
+
+// Overwrite the cached entry entirely
+func (ts *TorrentStats) Set(key [20]byte, v TorrentStat) {
+	ts.mu.Lock()
+	ts.data[key] = v
+	ts.mu.Unlock()
+}
+
+// Update only meta fields (ID/Section/Size) without clobbering live counters
+func (ts *TorrentStats) SetMeta(key [20]byte, id int, section string, size uint64) {
+	ts.mu.Lock()
+	cur := ts.data[key] // zero value if not present
+	cur.ID = id
+	cur.Section = section
+	if size > 0 {
+		cur.Size = size
+	}
+	ts.data[key] = cur
+	ts.mu.Unlock()
+}
+
+// Convenience: set by hex infohash
+func (ts *TorrentStats) SetHex(ihHex string, v TorrentStat) {
+	b, err := hex.DecodeString(ihHex)
+	if err != nil || len(b) != 20 {
+		return
+	}
+	var k [20]byte
+	copy(k[:], b)
+	ts.Set(k, v)
 }
