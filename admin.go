@@ -11,16 +11,24 @@ import (
 
 // Guard all admin endpoints with X-Admin-Key
 func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if config.AdminAPIKey == "" {
-		http.Error(w, "admin disabled", http.StatusForbidden)
-		return false
-	}
-	if r.Header.Get("X-Admin-Key") != config.AdminAPIKey {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
-	}
-	return true
+    if config.AdminAPIKey == "" {
+        http.Error(w, "admin disabled", http.StatusForbidden)
+        return false
+    }
+
+    key := r.Header.Get("X-Admin-Key")
+    if key == "" {
+        key = r.URL.Query().Get("key") // allow query string as fallback
+    }
+
+    if key != config.AdminAPIKey {
+        http.Error(w, "forbidden", http.StatusForbidden)
+        return false
+    }
+    return true
 }
+
+
 
 // GET /peers?info_hash=... [&page=1&page_size=50]
 // Header: X-Admin-Key: <key>

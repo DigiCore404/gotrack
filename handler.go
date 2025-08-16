@@ -12,8 +12,8 @@ import (
 	"time"
 	"fmt"
 	"bytes"
+       "crypto/sha1"
 )
-
 
 // maskPasskey shows head+tail and hides the middle
 func maskPasskey(pk string) string {
@@ -84,9 +84,8 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// after parseInfoHashLoose:
+	
 	inf, ok := parseInfoHashLoose(r)
-
 		if !ok {
     			if config.DebugAnnounce {
         			log.Printf("[ANNOUNCE REJECT] invalid info_hash ip=%s qs=%q", ip, r.URL.RawQuery)
@@ -94,12 +93,14 @@ func AnnounceHandler(w http.ResponseWriter, r *http.Request) {
     		BencodeError(w, "Invalid info hash"); return
 	}
 
-	pid, ok := parse20(r.URL.Query().Get("peer_id"))
 
+	pid, ok := parsePeerIDLoose(r)
 	if !ok {
 		BencodeError(w, "Invalid peer id")
 		return
 	}
+
+
 
 	if config.DebugAnnounce {
 		log.Printf("[ANNOUNCE INFO] ip=%s passkey=%s rawQS=%q",
@@ -754,5 +755,119 @@ func parseInfoHashLoose(r *http.Request) ([]byte, bool) {
 			return dst, true
 		}
 	}
+	return nil, false
+}
+
+
+// Percent-decoder that treats '+' as space (standard form encoding)
+func unescapePeerIDPlusIsSpace(s string) ([]byte, error) {
+	out := make([]byte, 0, 20)
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '%':
+			if i+2 >= len(s) {
+				return nil, fmt.Errorf("short escape")
+			}
+			v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, byte(v))
+			i += 3
+		case '+':
+			// '+' means space in form encoding
+			out = append(out, ' ')
+			i++
+		default:
+			out = append(out, s[i])
+			i++
+		}
+	}
+	return out, nil
+}
+
+// Percent-decoder that preserves '+' as literal 0x2B
+func unescapePeerIDPreservePlus(s string) ([]byte, error) {
+	out := make([]byte, 0, 20)
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '%':
+			if i+2 >= len(s) {
+				return nil, fmt.Errorf("short escape")
+			}
+			v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, byte(v))
+			i += 3
+		default:
+			out = append(out, s[i])
+			i++
+		}
+	}
+	return out, nil
+}
+
+// parsePeerIDLoose tries to decode peer_id from RawQuery, with multiple fallbacks.
+// Order:
+//   1) RawQuery token with '+' preserved and '+'→space variants
+//   2) Legacy Query().Get + QueryUnescape
+//   3) 40-char hex
+//   4) Fabricate if no_peer_id=1
+func parsePeerIDLoose(r *http.Request) ([]byte, bool) {
+	raw := r.URL.RawQuery
+
+	// --- RawQuery extraction (no decoding first) ---
+	if i := strings.Index(raw, "peer_id="); i >= 0 {
+		v := raw[i+len("peer_id="):]
+		if j := strings.IndexByte(v, '&'); j >= 0 {
+			v = v[:j]
+		}
+
+		// A) preserve '+' as 0x2B
+		varA, errA := unescapePeerIDPreservePlus(v)
+		if errA == nil && len(varA) == 20 {
+			return varA, true
+		}
+		// B) treat '+' as space
+		varB, errB := unescapePeerIDPlusIsSpace(v)
+		if errB == nil && len(varB) == 20 {
+			return varB, true
+		}
+	}
+
+	// --- Legacy fallback: Query().Get + QueryUnescape ---
+	if s := r.URL.Query().Get("peer_id"); s != "" {
+		// Normal form decoder (here '+' becomes space)
+		if dec, err := url.QueryUnescape(s); err == nil {
+			b := []byte(dec)
+			if len(b) == 20 {
+				return b, true
+			}
+		}
+		// Hex fallback if someone sent 40-char hex
+		if len(s) == 40 && isHex(s) {
+			dst := make([]byte, 20)
+			if _, err := hex.Decode(dst, []byte(s)); err == nil {
+				return dst, true
+			}
+		}
+	}
+
+	// --- Some clients omit peer_id when no_peer_id=1 is present ---
+	if r.URL.Query().Get("no_peer_id") == "1" {
+		h := sha1.Sum([]byte(
+			getRealIP(r) + "|" +
+				r.UserAgent() + "|" +
+				r.URL.Query().Get("port"),
+		))
+		// h[:] is 20 bytes already
+		if config.DebugAnnounce {
+			log.Printf("[ANNOUNCE PEER_ID] fabricated due to no_peer_id=1")
+		}
+		return h[:], true
+	}
+
 	return nil, false
 }
